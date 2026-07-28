@@ -6,11 +6,38 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { BunAdapter } from "../../src/bun-adapter";
 
 // Skip all tests if not running in Bun
 const isBun = typeof globalThis.Bun !== "undefined";
 const describeIfBun = isBun ? describe : describe.skip;
+
+/**
+ * Bun's `fetch` accepts two options the DOM type does not declare: `unix` (dial
+ * a socket path instead of a host) and `tls` (per-request TLS settings).
+ */
+type BunFetchInit = RequestInit & {
+  unix?: string;
+  tls?: { rejectUnauthorized?: boolean };
+};
+
+/**
+ * A self-signed certificate needs openssl. Where it is missing the TLS test
+ * skips rather than failing - an absent tool is not a defect in the adapter.
+ */
+const opensslPath = isBun ? Bun.which("openssl") : null;
+const itIfOpenssl = opensslPath ? it : it.skip;
 
 describeIfBun("BunAdapter E2E", () => {
   let adapter: BunAdapter;
@@ -206,7 +233,24 @@ describeIfBun("BunAdapter E2E", () => {
 
       const response = await fetch(`${baseUrl}/search/${encodeURIComponent("hello world")}`);
       const body = await response.json();
-      expect(body.query).toBe("hello%20world");
+      // Route params arrive decoded, matching what @Param() yields under the
+      // Express and Fastify adapters. This previously returned the raw escape.
+      expect(body.query).toBe("hello world");
+    });
+
+    it("should not crash on a malformed percent-escape in a parameter", async () => {
+      adapter.get("/search/:query", (req, res) => {
+        res.json({ query: req.params.query });
+      });
+
+      await adapter.listen(0);
+      const port = adapter.getHttpServer().server?.port;
+      baseUrl = `http://localhost:${port}`;
+
+      const response = await fetch(`${baseUrl}/search/%E0%A4%A`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.query).toBe("%E0%A4%A");
     });
   });
 
@@ -940,5 +984,360 @@ describeIfBun("BunAdapter E2E", () => {
       expect(bodies).toContainEqual({ delayed: 30 });
       expect(bodies).toContainEqual({ delayed: 10 });
     });
+  });
+
+  describe("Bun.serve option plumbing", () => {
+    it("should serve over a unix socket instead of a TCP port", async () => {
+      const socketPath = join(tmpdir(), `bun-adapter-${crypto.randomUUID()}.sock`);
+      adapter.setServerOptions({ unix: socketPath });
+      adapter.get("/ping", (req, res) => res.send("pong"));
+
+      try {
+        await adapter.listen(0);
+
+        // Host is ignored when `unix` is set; Bun dials the socket path.
+        const response = await fetch("http://localhost/ping", {
+          unix: socketPath,
+        } as BunFetchInit);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("pong");
+      } finally {
+        await adapter.close();
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      }
+    });
+
+    it("should reject a body larger than maxRequestBodySize", async () => {
+      adapter.setServerOptions({ maxRequestBodySize: 16 });
+      adapter.post("/upload", (req, res) => res.send("accepted"));
+
+      await adapter.listen(0);
+      const port = adapter.getHttpServer().server?.port;
+
+      const response = await fetch(`http://localhost:${port}/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: "x".repeat(1024),
+      });
+
+      // Bun refuses the request at the transport layer; the handler never runs.
+      expect(response.status).toBe(413);
+    });
+
+    it("should still accept a body within maxRequestBodySize", async () => {
+      adapter.setServerOptions({ maxRequestBodySize: 1024 });
+      adapter.post("/upload", (req, res) => res.send("accepted"));
+
+      await adapter.listen(0);
+      const port = adapter.getHttpServer().server?.port;
+
+      const response = await fetch(`http://localhost:${port}/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: "x".repeat(16),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("accepted");
+    });
+
+    it("should forward development and lowMemoryMode without breaking the server", async () => {
+      // NOTE: `lowMemoryMode: true` is deliberately NOT exercised here. On Bun
+      // 1.3.14 a bare `Bun.serve({ lowMemoryMode: true })` resets every
+      // connection (ECONNRESET) with no adapter involved, so asserting a
+      // working request under it would encode a runtime defect as expected
+      // behaviour. Only the forwarding is covered.
+      adapter.setServerOptions({ development: false, lowMemoryMode: false });
+      adapter.get("/opts", (req, res) => res.send("served"));
+
+      await adapter.listen(0);
+      const port = adapter.getHttpServer().server?.port;
+
+      const response = await fetch(`http://localhost:${port}/opts`);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("served");
+    });
+
+    itIfOpenssl("should serve over TLS when serverOptions.tls is supplied", async () => {
+      const certDir = mkdtempSync(join(tmpdir(), "bun-adapter-tls-"));
+      const keyPath = join(certDir, "k.pem");
+      const certPath = join(certDir, "c.pem");
+
+      try {
+        const generated = Bun.spawnSync([
+          opensslPath as string,
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-nodes",
+          "-keyout",
+          keyPath,
+          "-out",
+          certPath,
+          "-days",
+          "1",
+          "-subj",
+          "/CN=localhost",
+        ]);
+        expect(generated.exitCode).toBe(0);
+
+        adapter.setServerOptions({
+          tls: { key: readFileSync(keyPath), cert: readFileSync(certPath) },
+        });
+        adapter.get("/secure", (req, res) => res.send("over-tls"));
+
+        await adapter.listen(0, "127.0.0.1");
+        const port = adapter.getHttpServer().server?.port;
+
+        const response = await fetch(`https://127.0.0.1:${port}/secure`, {
+          tls: { rejectUnauthorized: false },
+        } as BunFetchInit);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("over-tls");
+      } finally {
+        rmSync(certDir, { recursive: true, force: true });
+      }
+    });
+
+    itIfOpenssl("should derive TLS from NestJS httpsOptions", async () => {
+      const certDir = mkdtempSync(join(tmpdir(), "bun-adapter-https-"));
+      const keyPath = join(certDir, "k.pem");
+      const certPath = join(certDir, "c.pem");
+
+      try {
+        const generated = Bun.spawnSync([
+          opensslPath as string,
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-nodes",
+          "-keyout",
+          keyPath,
+          "-out",
+          certPath,
+          "-days",
+          "1",
+          "-subj",
+          "/CN=localhost",
+        ]);
+        expect(generated.exitCode).toBe(0);
+
+        // This is the path `NestFactory.create(AppModule, adapter, { httpsOptions })`
+        // takes; it must reach Bun's `tls` option or the app serves plaintext.
+        adapter.initHttpServer({
+          httpsOptions: { key: readFileSync(keyPath), cert: readFileSync(certPath) },
+        });
+        adapter.get("/secure", (req, res) => res.send("https-options"));
+
+        await adapter.listen(0, "127.0.0.1");
+        const port = adapter.getHttpServer().server?.port;
+
+        const response = await fetch(`https://127.0.0.1:${port}/secure`, {
+          tls: { rejectUnauthorized: false },
+        } as BunFetchInit);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("https-options");
+      } finally {
+        rmSync(certDir, { recursive: true, force: true });
+      }
+    });
+
+    it("should NOT enable TLS when httpsOptions carries neither key nor cert", async () => {
+      // The silent-plaintext path: an httpsOptions object that configures
+      // nothing must leave the server on plain HTTP rather than half-configure
+      // TLS. Plain http answering is the proof that no TLS was installed.
+      adapter.initHttpServer({ httpsOptions: { passphrase: "unused" } });
+      adapter.get("/plain", (req, res) => res.send("plaintext"));
+
+      await adapter.listen(0);
+      const port = adapter.getHttpServer().server?.port;
+
+      const response = await fetch(`http://localhost:${port}/plain`);
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("plaintext");
+    });
+
+    it("should re-point a caller-supplied server at the adapter rather than starting a second one", async () => {
+      // The supplied instance used to be overwritten, so it kept serving
+      // whatever it was built with while the adapter listened elsewhere.
+      const existing = Bun.serve({ port: 0, fetch: () => new Response("old") });
+      const originalPort = existing.port;
+      const externalAdapter = new BunAdapter(existing);
+      externalAdapter.get("/adopted", (req, res) => res.send("served by adapter"));
+
+      try {
+        await externalAdapter.listen(0);
+
+        const response = await fetch(`http://localhost:${originalPort}/adopted`);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe("served by adapter");
+        // No second server: the adapter still owns the original port.
+        expect(externalAdapter.getHttpServer().server?.port).toBe(originalPort);
+      } finally {
+        await externalAdapter.close();
+      }
+    });
+
+    it("should invoke the listen callback when adopting an external server", async () => {
+      const existing = Bun.serve({ port: 0, fetch: () => new Response("old") });
+      const externalAdapter = new BunAdapter(existing);
+      let called = false;
+
+      try {
+        await externalAdapter.listen(0, () => {
+          called = true;
+        });
+
+        expect(called).toBe(true);
+      } finally {
+        await externalAdapter.close();
+      }
+    });
+  });
+
+  describe("static asset memory", () => {
+    /**
+     * Must run in a subprocess: the assertion is about this process's peak RSS,
+     * which the test runner's own allocations would swamp.
+     *
+     * Streaming and buffering are indistinguishable over HTTP, so peak memory is
+     * the only observable difference. Measured on this machine at 64 MB x 8
+     * concurrent readers: ~157 MB streaming (`res.send(file)`) versus ~1068 MB
+     * buffering (`res.send(new Uint8Array(await file.arrayBuffer()))`) - a 6.8x
+     * gap. The threshold sits between them with room for GC timing.
+     */
+    it("does not scale peak memory with filesize x concurrency", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "bun-adapter-static-rss-"));
+      // The served root is a subdirectory so the generated script is not itself
+      // reachable over HTTP as test scaffolding.
+      const assets = join(dir, "assets");
+      mkdirSync(assets);
+      const script = join(dir, "rss.ts");
+      const adapterPath = join(import.meta.dir, "..", "..", "src", "bun-adapter.ts");
+      const sizeMb = 64;
+      const concurrency = 8;
+
+      writeFileSync(
+        script,
+        [
+          `import { BunAdapter } from ${JSON.stringify(adapterPath)};`,
+          `import { writeFileSync } from "node:fs";`,
+          `import { join } from "node:path";`,
+          `const SIZE = ${sizeMb} * 1024 * 1024;`,
+          `writeFileSync(join(${JSON.stringify(assets)}, "big.bin"), Buffer.alloc(SIZE, 0x61));`,
+          `const adapter = new BunAdapter();`,
+          `adapter.useStaticAssets(${JSON.stringify(assets)});`,
+          `await adapter.listen(0);`,
+          `const port = adapter.getHttpServer().server.port;`,
+          `const base = process.memoryUsage.rss();`,
+          `let peak = base;`,
+          `await Promise.all(Array.from({ length: ${concurrency} }, async () => {`,
+          `  const response = await fetch("http://127.0.0.1:" + port + "/big.bin");`,
+          // Without these two checks the whole test passes when static serving
+          // is broken: a 404 streams nothing, so peak RSS stays near zero and
+          // the memory assertion is satisfied by the file never being served.
+          `  if (response.status !== 200) throw new Error("expected 200, got " + response.status);`,
+          `  const reader = response.body.getReader();`,
+          `  let bytes = 0;`,
+          `  for (;;) {`,
+          `    const { done, value } = await reader.read();`,
+          `    if (value) bytes += value.byteLength;`,
+          `    peak = Math.max(peak, process.memoryUsage.rss());`,
+          `    if (done) break;`,
+          `  }`,
+          `  if (bytes !== SIZE) throw new Error("short read: " + bytes + " of " + SIZE);`,
+          `}));`,
+          `console.log(Math.round((peak - base) / 1024 / 1024));`,
+          `await adapter.close();`,
+        ].join("\n")
+      );
+
+      let proc: ReturnType<typeof Bun.spawn> | undefined;
+      try {
+        proc = Bun.spawn(["bun", script], { stdout: "pipe", stderr: "pipe" });
+        // Drain both pipes concurrently: an undrained stderr larger than the
+        // pipe buffer blocks the child forever, and the test then dies on its
+        // timeout rather than on its assertion.
+        const [stdout, stderr] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        const exitCode = await proc.exited;
+
+        expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+        const peakDeltaMb = Number.parseInt(stdout.trim(), 10);
+        expect(Number.isNaN(peakDeltaMb)).toBe(false);
+        // Buffering costs ~16x the file size here; streaming ~2.5x.
+        expect(peakDeltaMb).toBeLessThan(sizeMb * 6);
+      } finally {
+        proc?.kill();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 60_000);
+  });
+
+  describe("close() event-loop handles", () => {
+    /**
+     * Must run in a subprocess: the assertion is about whether the runtime has
+     * anything left keeping it alive after `close()` resolves, which is only
+     * observable as process exit. Inside `bun test` the runner's own handles
+     * mask it entirely.
+     *
+     * `Promise.race` does not cancel the loser. Racing the graceful stop
+     * against `Bun.sleep(drainTimeoutMs)` therefore left the drain timer armed
+     * and referenced, so `close()` returned in ~0ms but the process hung for
+     * the full 10s window. Restoring that form fails this test.
+     *
+     * The child reports the wall clock at which `close()` resolved, and the
+     * assertion is on the gap between that and process exit - not on total
+     * runtime. That isolates the leaked handle from runtime startup, and keeps
+     * the test meaningful if the drain window is ever shortened.
+     */
+    it("releases the drain timer so the process exits once close() resolves", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "bun-adapter-close-"));
+      const script = join(dir, "close-exit.ts");
+      const adapterPath = join(import.meta.dir, "..", "..", "src", "bun-adapter.ts");
+
+      writeFileSync(
+        script,
+        [
+          `import { BunAdapter } from ${JSON.stringify(adapterPath)};`,
+          `const adapter = new BunAdapter();`,
+          `adapter.get("/", (_req, res) => res.send("ok"));`,
+          `await adapter.listen(0);`,
+          `await adapter.close();`,
+          `console.log(Date.now());`,
+        ].join("\n")
+      );
+
+      let proc: ReturnType<typeof Bun.spawn> | undefined;
+      try {
+        proc = Bun.spawn(["bun", script], { stdout: "pipe", stderr: "pipe" });
+        const [stdout, stderr] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        const exitCode = await proc.exited;
+        const exitedAt = Date.now();
+
+        expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+        const closedAt = Number.parseInt(stdout.trim(), 10);
+        expect(Number.isNaN(closedAt)).toBe(false);
+        // A leaked timer pins the process for the whole drain window (10s); a
+        // released one lets Bun exit as soon as the script ends.
+        expect(exitedAt - closedAt).toBeLessThan(2_000);
+      } finally {
+        proc?.kill();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 30_000);
   });
 });

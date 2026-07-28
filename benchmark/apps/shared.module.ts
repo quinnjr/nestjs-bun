@@ -1,4 +1,4 @@
-import { Module, Controller, Get, Post, Body, Param, Injectable } from "@nestjs/common";
+import { Module, Controller, Get, Post, Body, Param, Injectable, Inject } from "@nestjs/common";
 
 /**
  * Simple service for benchmark testing
@@ -54,7 +54,12 @@ export class BenchmarkService {
  */
 @Controller()
 export class BenchmarkController {
-  constructor(private readonly service: BenchmarkService) {}
+  // The token is stated explicitly rather than inferred from `design:paramtypes`,
+  // so DI does not depend on the transpiler emitting decorator metadata. A
+  // transpiler that skips it resolves type-inferred DI to `undefined` and every
+  // service-backed route returns HTTP 500 - which would compare a working app
+  // against a permanently broken baseline. See BENCHMARK.md.
+  constructor(@Inject(BenchmarkService) private readonly service: BenchmarkService) {}
 
   // Simple text response
   @Get()

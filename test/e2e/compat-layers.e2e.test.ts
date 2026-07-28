@@ -5,7 +5,7 @@
  * work correctly in integration scenarios.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   createExpressRequest,
   createExpressResponse,
@@ -15,8 +15,6 @@ import {
   createFastifyReply,
   FastifyHooksManager,
   FastifyPluginRegistry,
-  isFastifyMiddleware,
-  markAsFastify,
 } from "../../src/fastify-compat";
 
 describe("Express Compatibility E2E", () => {
@@ -154,7 +152,8 @@ describe("Express Compatibility E2E", () => {
         httpOnly: true,
         secure: true,
         sameSite: "strict",
-        maxAge: 3600,
+        // Express `maxAge` is milliseconds; it is serialized as Max-Age seconds
+        maxAge: 3600 * 1000,
       });
       res.json({ ok: true });
 
@@ -628,7 +627,8 @@ describe("Express Additional Coverage", () => {
       const res = createExpressResponse();
       res.set("X-Remove", "value");
       res.removeHeader("X-Remove");
-      expect(res.get("X-Remove")).toBeNull();
+      // Express and Node report an unset header as undefined, not null
+      expect(res.get("X-Remove")).toBeUndefined();
     });
 
     it("should handle append", () => {
@@ -754,22 +754,32 @@ describe("Express Additional Coverage", () => {
 
 describe("Fastify Additional Coverage", () => {
   describe("Request validation methods", () => {
-    it("should return undefined from getValidationFunction", () => {
+    it("should throw from getValidationFunction", () => {
+      // Returning undefined made callers fail with "validate is not a function"
+      // from a stack pointing at their own code, not at the shim.
       const bunRequest = new Request("http://localhost:3000/test");
       const req = createFastifyRequest(bunRequest);
-      expect(req.getValidationFunction("body")).toBeUndefined();
+      expect(() => req.getValidationFunction("body")).toThrow(
+        "Schema validation is not implemented; use a NestJS ValidationPipe"
+      );
     });
 
-    it("should return undefined from compileValidationSchema", () => {
+    it("should throw from compileValidationSchema", () => {
       const bunRequest = new Request("http://localhost:3000/test");
       const req = createFastifyRequest(bunRequest);
-      expect(req.compileValidationSchema({}, "body")).toBeUndefined();
+      expect(() => req.compileValidationSchema({}, "body")).toThrow(
+        "Schema validation is not implemented; use a NestJS ValidationPipe"
+      );
     });
 
-    it("should return true from validateInput", () => {
+    it("should throw from validateInput", () => {
+      // The shim refuses to fake schema validation: silently returning true
+      // would let unvalidated input through.
       const bunRequest = new Request("http://localhost:3000/test");
       const req = createFastifyRequest(bunRequest);
-      expect(req.validateInput({}, {}, "body")).toBe(true);
+      expect(() => req.validateInput({}, {}, "body")).toThrow(
+        "Schema validation is not implemented; use a NestJS ValidationPipe"
+      );
     });
   });
 
@@ -793,15 +803,21 @@ describe("Fastify Additional Coverage", () => {
       expect(reply.getHeader("Content-Type")).toBe("text/xml");
     });
 
-    it("should warn when send is called twice", () => {
+    it("should throw when send is called twice", () => {
       const reply = createFastifyReply();
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
       reply.send("first");
-      reply.send("second");
 
-      expect(warnSpy).toHaveBeenCalledWith("Reply already sent");
-      warnSpy.mockRestore();
+      // Fastify itself throws FST_ERR_REP_ALREADY_SENT rather than warning
+      let thrown: unknown;
+      try {
+        reply.send("second");
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as { code?: string }).code).toBe("FST_ERR_REP_ALREADY_SENT");
     });
 
     it("should handle redirect with default 302 status", () => {
@@ -1207,26 +1223,6 @@ describe("Fastify Branch Coverage", () => {
     await expect(
       registry.initializePlugins(mockInstance as unknown as Parameters<typeof registry.initializePlugins>[0])
     ).rejects.toThrow("Plugin init failed");
-  });
-});
-
-describe("Fastify Middleware Markers", () => {
-  it("should identify unmarked functions as not Fastify", () => {
-    const fn = () => {};
-    expect(isFastifyMiddleware(fn)).toBe(false);
-  });
-
-  it("should mark and identify Fastify middleware", () => {
-    const fn = () => {};
-    const marked = markAsFastify(fn);
-    expect(isFastifyMiddleware(marked)).toBe(true);
-  });
-
-  it("should return the same function when marking", () => {
-    const fn = () => "test";
-    const marked = markAsFastify(fn);
-    expect(marked).toBe(fn);
-    expect(marked()).toBe("test");
   });
 });
 
